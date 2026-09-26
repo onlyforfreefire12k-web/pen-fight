@@ -1,0 +1,8 @@
+# Telegram Bot API wrapper — v21 fully supports WebAppInfo + web_app buttons
+python-telegram-bot==21.9
+
+# Tiny web server that keeps the service alive on Render etc.
+Flask==3.1.0
+
+# Loads BOT_TOKEN / GAME_URL / PORT from the .env file
+python-dotenv==1.0.1
