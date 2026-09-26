@@ -1,0 +1,19 @@
+# Render Blueprint — https://render.com/docs/blueprint-spec
+#
+# Deploy from a repo whose ROOT is this backend/ directory, or set the
+# service's "Root Directory" to backend/ in the dashboard.
+
+services:
+  - type: web
+    name: 3d-room-backend
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python live.py
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: PYTHON_VERSION
+        value: 3.12.8
