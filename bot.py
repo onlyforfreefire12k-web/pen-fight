@@ -1,24 +1,18 @@
-"""Pen Fight Bot for Telegram.
+"""Pen Fight Bot — commands + security layer.
 
-Handlers:
-    /start      -> short welcome message
-    /game       -> Mini App launch button (DM + groups + supergroups)
-    /gmute      -> globally mute a user (reply to their message, auth users only)
-    /ungmute    -> remove a global mute (reply to their message, auth users only)
-    /gmuteinfo  -> show a user's global mute status (reply, auth users only)
+Two clients live in this process:
+  1. THIS PTB bot   — commands, Mini App button, login flow UI, moderation.
+  2. Pyrogram userbot (userbot.py) — MTProto session used for admin-level
+     enforcement (demote/ban, VC kick). Runs in its own thread.
 
-Plus a group message watcher that auto-deletes every message sent by a
-globally muted user, in EVERY group/supergroup where this bot is admin.
+Authorization
+  • AUTH_USER_IDS (env, comma-separated) — who may use security commands.
+  • OWNER_ID is ALWAYS authorized (auto-added to the set).
+  • /game is PUBLIC — anyone can play, no auth needed.
 
-WHY URL BUTTONS (and not web_app=WebAppInfo):
-    Telegram does NOT allow inline Web App buttons inside groups —
-    Bot API rejects them with "400 Bad Request: Button_type_invalid".
-    A normal URL button works everywhere (DM + group + supergroup).
-    Pointing that URL at the Mini App direct link
-    (https://t.me/<bot>/<short_name>) opens the game INSIDE Telegram
-    as a Mini App — the same technique used by the 3D Music Room bot.
-
-The bot is started from live.py (see run_bot() / start_bot_thread() below).
+Chat scope
+  • PRIVATE chats + GROUPS (public + private) → handled.
+  • CHANNELS → completely ignored (no handler matches).
 """
 
 import asyncio
@@ -28,11 +22,11 @@ import os
 import threading
 
 from telegram import (
-    Chat,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Update,
 )
+from telegram.constants import ChatType
 from telegram.error import InvalidToken, TelegramError
 from telegram.ext import (
     Application,
@@ -42,40 +36,48 @@ from telegram.ext import (
     filters,
 )
 
-from config import BOT_TOKEN
+import config
+from config import BOT_TOKEN, OWNER_ID
+from database import db
+from userbot import call_userbot, userbot
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Pen Fight Mini App
+# Authorization
 # ---------------------------------------------------------------------------
-
-# Official Mini App direct link (configured in BotFather):
-#   bot:        @Penfightgamebot
-#   short name: penfight
-#   web app:    https://node-static-3fe2b.wasmer.app/
-MINI_APP_URL = "https://t.me/Penfightgamebot/penfight"
-
-# ---------------------------------------------------------------------------
-# Authorized users (GMUTE)
-# ---------------------------------------------------------------------------
-# Only these Telegram user IDs may use /gmute, /ungmute and /gmuteinfo.
-# Set AUTH_USER_IDS in your environment as a comma-separated list of numeric IDs,
-# e.g. AUTH_USER_IDS=123456789,987654321
-AUTH_USER_IDS = {
+# Reuse the SAME env variable as before — no separate auth system.
+AUTH_USER_IDS: set[int] = {
     int(uid.strip())
     for uid in os.environ.get("AUTH_USER_IDS", "").split(",")
     if uid.strip().isdigit()
 }
 
+# Owner is always authorized, no need to add their id to the env manually.
+if OWNER_ID:
+    AUTH_USER_IDS.add(OWNER_ID)
+
 if not AUTH_USER_IDS:
     logger.warning(
-        "AUTH_USER_IDS is empty — /gmute, /ungmute, /gmuteinfo are DISABLED for everyone."
+        "No authorized users (AUTH_USER_IDS empty). Security commands disabled."
     )
 
+
+def is_authorized(user_id: int | None) -> bool:
+    return user_id is not None and user_id in AUTH_USER_IDS
+
+
 # ---------------------------------------------------------------------------
-# Messages
+# Mini App / texts / keyboards
 # ---------------------------------------------------------------------------
+
+MINI_APP_URL = "https://t.me/Penfightgamebot/penfight"
+
+NO_ACCESS_TEXT = (
+    "🚫 <b>Access Denied</b>\n\n"
+    "You don't have permission to use this bot.\n"
+    "Contact the owner if you think this is a mistake."
+)
 
 WELCOME_TEXT = (
     "🎮 <b>Welcome to Pen Fight!</b> 🖊️\n\n"
@@ -83,46 +85,367 @@ WELCOME_TEXT = (
     "Use /game to start playing."
 )
 
-# Short group-friendly promo, identical in DM and in groups/supergroups.
-GAME_TEXT = (
-    "🖊️ <b>PEN FIGHT</b>\n\n"
-    "Ready to play? Tap below to enter the game."
-)
+GAME_TEXT = "🖊️ <b>PEN FIGHT</b>\n\nReady to play? Tap below to enter the game."
+
+
+def _game_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🖊️ PLAY PEN FIGHT", url=MINI_APP_URL)]]
+    )
+
 
 # ---------------------------------------------------------------------------
-# GMUTE — global mute storage (persistent file + in-memory cache)
+# Filters — CHANNELS are always excluded
 # ---------------------------------------------------------------------------
-#
-# This backend project has NO database (Firebase belongs to the Pen Fight
-# game frontend, untouched per spec), so the smallest possible persistent
-# solution is a tiny JSON file. The muted user IDs are cached in a set in
-# memory, so the per-message delete check is a pure O(1) lookup with NO
-# disk/network request. The file is only touched on /gmute and /ungmute.
-#
-# If you later want cross-instance persistence (e.g. Firebase), only
-# _load_gmuted() / _save_gmuted() need to change — nothing else.
+
+NOT_CHANNEL = ~filters.ChatType.CHANNEL
+GROUPS_ONLY = filters.ChatType.GROUPS
+
+
+# ---------------------------------------------------------------------------
+# PUBLIC commands (NO auth)
+# ---------------------------------------------------------------------------
+
+async def game_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Public — anyone, anywhere (DM or group)."""
+    if update.message:
+        await update.message.reply_text(
+            GAME_TEXT, parse_mode="HTML", reply_markup=_game_keyboard()
+        )
+
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """DM: gate by auth. Group: short promo. Channel: ignored."""
+    if not update.message or not update.effective_user or not update.effective_chat:
+        return
+
+    chat_type = update.effective_chat.type
+
+    # Group → short promo, no menu leak
+    if chat_type in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await update.message.reply_text(
+            WELCOME_TEXT, parse_mode="HTML", reply_markup=_game_keyboard()
+        )
+        return
+
+    # Channel → ignore (should never happen, but be safe)
+    if chat_type == ChatType.CHANNEL:
+        return
+
+    # DM → gate by auth
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text(NO_ACCESS_TEXT, parse_mode="HTML")
+        return
+
+    menu = (
+        "🛡️ <b>Pen Fight Security</b>\n\n"
+        "<b>Account</b>\n"
+        "/login — connect your Telegram account\n"
+        "/logout — disconnect your account\n"
+        "/session — session status\n\n"
+        "<b>Moderation</b> (reply to a user's message)\n"
+        "/blacklist — block from groups & voice chats\n"
+        "/unblacklist — remove from blacklist\n"
+        "/trust — exempt an admin from auto-punish\n"
+        "/untrust — remove exemption\n"
+        "/gmute — globally mute · /ungmute · /gmuteinfo\n\n"
+        "<b>Reports</b>\n"
+        "/security — security dashboard\n"
+        "/logs — recent security events\n\n"
+        "<b>Public</b>\n"
+        "/game — play Pen Fight"
+    )
+    await update.message.reply_text(
+        menu, parse_mode="HTML", reply_markup=_game_keyboard()
+    )
+
+
+# ---------------------------------------------------------------------------
+# Login flow (DM only, authorized only)
+# ---------------------------------------------------------------------------
+
+_LOGIN_STATES: dict[int, dict] = {}
+
+
+def _is_dm(update: Update) -> bool:
+    return (
+        update.effective_chat is not None
+        and update.effective_chat.type == ChatType.PRIVATE
+    )
+
+
+async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+    if not _is_dm(update):
+        await update.message.reply_text("🔒 /login only works in the bot's DM.")
+        return
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text(NO_ACCESS_TEXT, parse_mode="HTML")
+        return
+    if not config.API_ID or not config.API_HASH:
+        await update.message.reply_text(
+            "⚙️ API_ID / API_HASH not set. Add them to .env first."
+        )
+        return
+
+    user_id = update.effective_user.id
+    if await db.get_session(user_id):
+        await update.message.reply_text(
+            "ℹ️ You already have an active session. Use /logout first."
+        )
+        return
+
+    _LOGIN_STATES[user_id] = {"step": "phone"}
+    await update.message.reply_text(
+        "📱 <b>Login Started</b>\n\n"
+        "Send your phone number in international format:\n"
+        "<code>+1234567890</code>",
+        parse_mode="HTML",
+    )
+
+
+async def logout_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+    if not _is_dm(update):
+        await update.message.reply_text("🔒 /logout only works in the bot's DM.")
+        return
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text(NO_ACCESS_TEXT, parse_mode="HTML")
+        return
+
+    await update.message.reply_text("⏳ Logging out…")
+    result = await call_userbot(userbot.logout(update.effective_user.id))
+    await update.message.reply_text(result.get("message", "Done."))
+
+
+async def session_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text(NO_ACCESS_TEXT, parse_mode="HTML")
+        return
+
+    sess = await db.get_session(update.effective_user.id)
+    if sess:
+        await update.message.reply_text(
+            "🔐 <b>Session</b>\n\n"
+            "Status: 🟢 Connected\n"
+            f"Phone: {sess.get('phone') or '—'}\n"
+            f"Last used: {sess.get('last_used') or '—'}",
+            parse_mode="HTML",
+        )
+    else:
+        await update.message.reply_text(
+            "🔐 <b>Session</b>\n\nStatus: 🔴 Not connected\nUse /login to start.",
+            parse_mode="HTML",
+        )
+
+
+async def login_flow_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle phone / OTP / 2FA-password while a user is in the login flow."""
+    if not update.message or not update.effective_user or not update.message.text:
+        return
+    user_id = update.effective_user.id
+    state = _LOGIN_STATES.get(user_id)
+    if not state or not _is_dm(update):
+        return
+
+    text = update.message.text.strip()
+    step = state["step"]
+
+    # ---- phone ----
+    if step == "phone":
+        if not text.startswith("+"):
+            await update.message.reply_text("❌ Use international format: +1234567890")
+            return
+        await update.message.reply_text("⏳ Sending verification code…")
+        result = await call_userbot(userbot.login_start(text))
+
+        if not result.get("success"):
+            await update.message.reply_text(f"❌ {result.get('message')}")
+            _LOGIN_STATES.pop(user_id, None)
+            return
+
+        state["phone"] = text
+        state["phone_code_hash"] = result["phone_code_hash"]
+        state["step"] = "code"
+        await update.message.reply_text(
+            "✅ Code sent to your Telegram account.\n"
+            "Now send the code (e.g. <code>12345</code>).",
+            parse_mode="HTML",
+        )
+
+    # ---- code ----
+    elif step == "code":
+        code = text.replace("-", "").replace(" ", "")
+        await update.message.reply_text("⏳ Verifying code…")
+        result = await call_userbot(
+            userbot.login_complete(state["phone"], state["phone_code_hash"], code)
+        )
+
+        if result.get("success"):
+            _LOGIN_STATES.pop(user_id, None)
+            await update.message.reply_text(
+                f"✅ {result.get('message')}\n\nUserbot monitoring is now ACTIVE."
+            )
+        elif result.get("needs_password"):
+            try:
+                await update.message.delete()
+            except TelegramError:
+                pass
+            state["step"] = "password"
+            state["code"] = code
+            await update.message.reply_text(
+                "🔐 <b>2FA enabled.</b>\nSend your password — I'll delete it instantly.",
+                parse_mode="HTML",
+            )
+        else:
+            await update.message.reply_text(f"❌ {result.get('message')}")
+            _LOGIN_STATES.pop(user_id, None)
+
+    # ---- password (2FA) ----
+    elif step == "password":
+        try:
+            await update.message.delete()
+        except TelegramError:
+            pass
+        result = await call_userbot(
+            userbot.login_complete(
+                state["phone"], state["phone_code_hash"],
+                state.get("code", ""), password=text,
+            )
+        )
+        _LOGIN_STATES.pop(user_id, None)
+        if result.get("success"):
+            await update.message.reply_text(
+                f"✅ {result.get('message')}\n\nUserbot monitoring is now ACTIVE."
+            )
+        else:
+            await update.message.reply_text(f"❌ {result.get('message')}")
+
+
+# ---------------------------------------------------------------------------
+# Moderation (auth + groups + reply-based)
+# ---------------------------------------------------------------------------
+
+def _target_from_reply(update: Update):
+    msg = update.message
+    if not msg or not msg.reply_to_message:
+        return None
+    return msg.reply_to_message.from_user
+
+
+async def _deny_if_not_allowed(update: Update) -> bool:
+    """Return True if the caller is NOT allowed and we already replied."""
+    if not update.message or not update.effective_user:
+        return True
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text(NO_ACCESS_TEXT, parse_mode="HTML")
+        return True
+    chat = update.effective_chat
+    if chat is None or chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await update.message.reply_text(
+            "⚠️ This command only works in groups. Reply to a user's message."
+        )
+        return True
+    return False
+
+
+async def blacklist_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await _deny_if_not_allowed(update):
+        return
+    target = _target_from_reply(update)
+    if not target or target.is_bot:
+        await update.message.reply_text("Reply to a user's message with /blacklist.")
+        return
+
+    await db.add_blacklist(
+        user_id=target.id, added_by=update.effective_user.id,
+    )
+    await db.log(
+        "BLACKLIST_ADD", severity="WARNING",
+        actor_id=update.effective_user.id, target_id=target.id,
+        chat_id=update.effective_chat.id,
+    )
+    await update.message.reply_text(
+        f"🚫 {target.first_name} blacklisted.\n"
+        "They will be kicked from groups and voice chats automatically."
+    )
+
+
+async def unblacklist_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await _deny_if_not_allowed(update):
+        return
+    target = _target_from_reply(update)
+    if not target:
+        await update.message.reply_text("Reply to a user's message with /unblacklist.")
+        return
+
+    await db.remove_blacklist(target.id)
+    await db.log(
+        "BLACKLIST_REMOVE", actor_id=update.effective_user.id,
+        target_id=target.id, chat_id=update.effective_chat.id,
+    )
+    await update.message.reply_text(f"✅ {target.first_name} removed from blacklist.")
+
+
+async def trust_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await _deny_if_not_allowed(update):
+        return
+    target = _target_from_reply(update)
+    if not target:
+        await update.message.reply_text("Reply to a user's message with /trust.")
+        return
+
+    await db.add_trusted(target.id, update.effective_user.id)
+    await db.log(
+        "TRUST_ADD", actor_id=update.effective_user.id, target_id=target.id,
+        chat_id=update.effective_chat.id,
+    )
+    await update.message.reply_text(
+        f"🛡️ {target.first_name} trusted — exempt from auto-punish."
+    )
+
+
+async def untrust_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await _deny_if_not_allowed(update):
+        return
+    target = _target_from_reply(update)
+    if not target:
+        await update.message.reply_text("Reply to a user's message with /untrust.")
+        return
+
+    await db.remove_trusted(target.id)
+    await db.log(
+        "TRUST_REMOVE", actor_id=update.effective_user.id, target_id=target.id,
+        chat_id=update.effective_chat.id,
+    )
+    await update.message.reply_text(f"✅ {target.first_name} is no longer trusted.")
+
+
+# ---------------------------------------------------------------------------
+# GMUTE (existing behaviour — unified auth check)
+# ---------------------------------------------------------------------------
 
 GMUTE_FILE = "gmute_users.json"
-
-# In-memory cache: {telegram_user_id, ...} — checked on every group message.
 _global_muted: set[int] = set()
 
 
 def _load_gmuted() -> set[int]:
-    """Load muted user IDs from disk. Never crashes the bot."""
     try:
         if os.path.exists(GMUTE_FILE):
             with open(GMUTE_FILE, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
             if isinstance(data, list):
-                return {int(uid) for uid in data}
+                return {int(u) for u in data}
     except (OSError, ValueError) as exc:
         logger.error("Could not load %s: %s", GMUTE_FILE, exc)
     return set()
 
 
 def _save_gmuted() -> None:
-    """Persist the current muted set. Never crashes the bot."""
     try:
         with open(GMUTE_FILE, "w", encoding="utf-8") as fh:
             json.dump(sorted(_global_muted), fh)
@@ -130,310 +453,226 @@ def _save_gmuted() -> None:
         logger.error("Could not save %s: %s", GMUTE_FILE, exc)
 
 
-# Load once at startup — survives restarts/redeploys via the JSON file.
 _global_muted = _load_gmuted()
 logger.info("GMUTE: loaded %d globally muted user(s).", len(_global_muted))
 
 
-def _is_auth_user(update: Update) -> bool:
-    """True only if the command sender is in the AUTH_USER_IDS whitelist."""
-    user = update.effective_user
-    if not user:
-        return False
-    return user.id in AUTH_USER_IDS
-
-
-async def _sender_is_group_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """True only if the command sender is an admin of the CURRENT group.
-
-    Normal members can NOT use /gmute, /ungmute or /gmuteinfo.
-    """
-    user = update.effective_user
-    chat = update.effective_chat
-    if not (user and chat):
-        return False
-    if chat.type not in (Chat.GROUP, Chat.SUPERGROUP):
-        return False
-    try:
-        member = await context.bot.get_chat_member(chat.id, user.id)
-    except TelegramError as exc:
-        logger.warning("get_chat_member failed in %s: %s", chat.id, exc)
-        return False
-    status = getattr(member.status, "value", member.status)
-    return status in ("administrator", "creator")
-
-
-def _target_from_reply(update: Update):
-    """Get the actual telegram.User from the REPLIED-TO message.
-
-    Uses the real Telegram user_id — never trusted username text.
-    Returns None when there is no reply or no from_user.
-    """
-    message = update.message
-    if not message or not message.reply_to_message:
-        return None
-    return message.reply_to_message.from_user
-
-
-# ---------------------------------------------------------------------------
-# Command handlers
-# ---------------------------------------------------------------------------
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Reply to /start with a simple welcome message."""
-    if update.message:
-        await update.message.reply_text(WELCOME_TEXT, parse_mode="HTML")
-
-
-async def game_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Reply to /game with the Mini App launch button (DM + groups)."""
-    keyboard = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "🖊️ PLAY PEN FIGHT",
-                    # NORMAL URL button -> Pen Fight Mini App direct link.
-                    url=MINI_APP_URL,
-                )
-            ]
-        ]
-    )
-
-    if update.message:
-        await update.message.reply_text(
-            GAME_TEXT, parse_mode="HTML", reply_markup=keyboard
-        )
-
-
 async def gmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/gmute (reply to a user's message) — globally mute them, auth users only."""
-    message = update.message
-    if not message or not message.chat:
+    if await _deny_if_not_allowed(update):
         return
-
-    if message.chat.type not in (Chat.GROUP, Chat.SUPERGROUP):
-        await message.reply_text("This command only works in groups.")
-        return
-
-    if not _is_auth_user(update):
-        await message.reply_text("⛔ Only authorized users can use this command.")
-        return
-
     target = _target_from_reply(update)
-    if target is None:
-        await message.reply_text("Reply to a user's message with /gmute to mute them globally.")
+    if not target:
+        await update.message.reply_text("Reply with /gmute to mute globally.")
         return
-
     if target.id == context.bot.id:
-        await message.reply_text("I can't globally mute myself.")
+        await update.message.reply_text("I can't globally mute myself.")
         return
-
     if target.id in _global_muted:
-        await message.reply_text("That user is already globally muted.")
+        await update.message.reply_text("That user is already globally muted.")
         return
 
     _global_muted.add(target.id)
     _save_gmuted()
-    logger.info("GMUTE: %s muted globally (total %d).", target.id, len(_global_muted))
-    await message.reply_text("🔇 User has been globally muted.")
+    await db.log("GMUTE_ADD", actor_id=update.effective_user.id, target_id=target.id)
+    await update.message.reply_text("🔇 User has been globally muted.")
 
 
 async def ungmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/ungmute (reply to a user's message) — remove global mute, auth users only."""
-    message = update.message
-    if not message or not message.chat:
+    if await _deny_if_not_allowed(update):
         return
-
-    if message.chat.type not in (Chat.GROUP, Chat.SUPERGROUP):
-        await message.reply_text("This command only works in groups.")
-        return
-
-    if not _is_auth_user(update):
-        await message.reply_text("⛔ Only authorized users can use this command.")
-        return
-
     target = _target_from_reply(update)
-    if target is None:
-        await message.reply_text("Reply to a user's message with /ungmute to unmute them.")
+    if not target:
+        await update.message.reply_text("Reply with /ungmute.")
         return
-
     if target.id not in _global_muted:
-        await message.reply_text("That user is not globally muted.")
+        await update.message.reply_text("That user is not globally muted.")
         return
 
     _global_muted.discard(target.id)
     _save_gmuted()
-    logger.info("GMUTE: %s unmuted globally (total %d).", target.id, len(_global_muted))
-    await message.reply_text("🔊 User has been globally unmuted.")
+    await db.log("GMUTE_REMOVE", actor_id=update.effective_user.id, target_id=target.id)
+    await update.message.reply_text("🔊 User has been globally unmuted.")
 
 
 async def gmuteinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/gmuteinfo (reply to a user's message) — show mute status, auth users only."""
-    message = update.message
-    if not message or not message.chat:
+    if await _deny_if_not_allowed(update):
         return
-
-    if message.chat.type not in (Chat.GROUP, Chat.SUPERGROUP):
-        await message.reply_text("This command only works in groups.")
-        return
-
-    if not _is_auth_user(update):
-        await message.reply_text("⛔ Only authorized users can use this command.")
-        return
-
     target = _target_from_reply(update)
-    if target is None:
-        await message.reply_text("Reply to a user's message with /gmuteinfo.")
+    if not target:
+        await update.message.reply_text("Reply with /gmuteinfo.")
         return
 
-    full_name = " ".join(part for part in (target.first_name, target.last_name) if part)
+    full_name = " ".join(p for p in (target.first_name, target.last_name) if p)
     username = f"@{target.username}" if target.username else "—"
     muted = target.id in _global_muted
-    status = "🔇 GLOBALLY MUTED" if muted else "🔊 not muted"
+    blacklisted = await db.is_blacklisted(target.id)
+    trusted = await db.is_trusted(target.id)
 
-    await message.reply_text(
-        "🛡 GMUTE INFO\n\n"
+    await update.message.reply_text(
+        "🛡️ <b>USER INFO</b>\n\n"
         f"Name: {full_name}\n"
         f"Username: {username}\n"
-        f"User ID: {target.id}\n"
-        f"Status: {status}"
+        f"User ID: <code>{target.id}</code>\n"
+        f"GMute: {'🔇 muted' if muted else '🔊 not muted'}\n"
+        f"Blacklist: {'🚫 yes' if blacklisted else '✅ no'}\n"
+        f"Trusted: {'🛡️ yes' if trusted else '❌ no'}",
+        parse_mode="HTML",
     )
 
 
 # ---------------------------------------------------------------------------
-# GMUTE watcher — auto-delete messages from globally muted users
+# GMUTE watcher
 # ---------------------------------------------------------------------------
 
 async def gmute_watcher(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Delete every message sent by a globally muted user, in ANY group.
-
-    Runs AFTER command handlers (separate handler group), is triggered by
-    all normal user messages (text, photos, videos, documents, stickers,
-    GIFs/animations, voice, audio, video notes, edited messages, ...).
-
-    The mute check is an O(1) in-memory set lookup — no disk/network I/O.
-    Never replies, never warns, never crashes the bot.
-    """
     message = update.effective_message
     if message is None:
         return
-
     user = message.from_user
     if user is None or user.is_bot:
-        # channel posts / anonymous senders / service messages / our own bot
         return
-
     if user.id not in _global_muted:
         return
-
     try:
         await message.delete()
     except TelegramError as exc:
-        # Bot not admin here, message already gone, or older than 48h —
-        # ignore and keep the bot running.
-        logger.debug(
-            "GMUTE delete failed (chat %s, msg %s): %s",
-            message.chat_id,
-            message.message_id,
-            exc,
-        )
+        logger.debug("GMUTE delete failed chat=%s msg=%s: %s",
+                     message.chat_id, message.message_id, exc)
 
 
-# All normal user messages in groups/supergroups, EXCLUDING service messages
-# (joins/leaves, pins, topic changes — never touch those).
-GMUTE_MSG_FILTER = (
-    filters.ALL
-    & ~filters.StatusUpdate.ALL
-    & filters.ChatType.GROUPS
+GMUTE_MSG_FILTER = filters.ALL & ~filters.StatusUpdate.ALL & filters.ChatType.GROUPS
+
+# Login flow only picks up non-command DM text.
+LOGIN_FLOW_FILTER = (
+    filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND
 )
 
 
 # ---------------------------------------------------------------------------
-# Error handling — never fail silently
+# Info commands
 # ---------------------------------------------------------------------------
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Log every Telegram API / handler error instead of crashing silently."""
-    logger.error(
-        "Error while processing an update: %s",
-        context.error,
-        exc_info=context.error,
+async def security_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text(NO_ACCESS_TEXT, parse_mode="HTML")
+        return
+
+    sess = await db.get_session(OWNER_ID) if OWNER_ID else None
+    groups = await db.list_groups()
+    blacklist = await db.list_blacklist()
+
+    account = "🟢 Connected" if sess else "🔴 Not connected"
+    userbot_status = "🟢 RUNNING" if userbot.is_running else "🔴 STOPPED"
+
+    await update.message.reply_text(
+        "🛡️ <b>SECURITY STATUS</b>\n\n"
+        f"Userbot: {userbot_status}\n"
+        f"Account: {account}\n"
+        f"Monitored groups: {len(groups)}\n"
+        f"Blacklisted users: {len(blacklist)}\n"
+        f"Globally muted: {len(_global_muted)}\n\n"
+        f"Abuse window: {config.ABUSE_THRESHOLD} removals / {config.ABUSE_WINDOW_SECONDS}s",
+        parse_mode="HTML",
     )
 
 
+async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text(NO_ACCESS_TEXT, parse_mode="HTML")
+        return
+
+    events = await db.recent_logs(limit=10)
+    if not events:
+        await update.message.reply_text("ℹ️ No security events yet.")
+        return
+
+    emoji = {"INFO": "ℹ️", "WARNING": "⚠️", "CRITICAL": "🚨", "ERROR": "❌"}
+    lines = ["📋 <b>RECENT SECURITY EVENTS</b>\n"]
+    for ev in events:
+        e = emoji.get(ev.get("severity", "INFO"), "ℹ️")
+        lines.append(
+            f"{e} <b>{ev['event_type']}</b>\n"
+            f"  actor: {ev.get('actor_id') or '—'} · target: {ev.get('target_id') or '—'}\n"
+            f"  {ev.get('timestamp')}\n"
+        )
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
 # ---------------------------------------------------------------------------
-# Bot startup (called from live.py)
+# Error handler
+# ---------------------------------------------------------------------------
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error("Update error: %s", context.error, exc_info=context.error)
+
+
+# ---------------------------------------------------------------------------
+# Startup
 # ---------------------------------------------------------------------------
 
 def run_bot() -> None:
-    """Build the Application and start long polling.
-
-    Designed to run inside a background thread next to Flask:
-    stop_signals=None is mandatory because signal handlers are only
-    allowed in the main thread. This avoids event-loop / signal
-    conflicts between Flask and python-telegram-bot.
-
-    PYTHON 3.12 FIX (Render) — KEPT, DO NOT REMOVE:
-    Python 3.12 no longer creates an event loop automatically in
-    non-main threads, so asyncio.get_event_loop() — which
-    run_polling() calls internally — raises:
-        "RuntimeError: There is no current event loop in thread '…'"
-    The fix is to create and set a fresh event loop for THIS thread
-    before anything touches asyncio.
-    """
-    # --- Python 3.12 / Render event-loop fix (do this FIRST) -------------
+    """Build PTB Application and start long polling (background thread)."""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    # ----------------------------------------------------------------------
 
     try:
         application = Application.builder().token(BOT_TOKEN).build()
 
-        # --- Existing commands (UNCHANGED) ---
-        application.add_handler(CommandHandler("start", start_command))
-        application.add_handler(CommandHandler("game", game_command))
+        # ---- public ----
+        application.add_handler(CommandHandler("game", game_command, filters=NOT_CHANNEL))
+        application.add_handler(CommandHandler("start", start_command, filters=NOT_CHANNEL))
 
-        # --- GMUTE commands (auth users only) ---
-        # CommandHandler automatically accepts "/gmute" and
-        # "/gmute@YourBot" (mention must match this bot's username).
-        application.add_handler(CommandHandler("gmute", gmute_command))
-        application.add_handler(CommandHandler("ungmute", ungmute_command))
-        application.add_handler(CommandHandler("gmuteinfo", gmuteinfo_command))
+        # ---- login (DM only, enforced inside handler too) ----
+        application.add_handler(CommandHandler("login", login_command, filters=NOT_CHANNEL))
+        application.add_handler(CommandHandler("logout", logout_command, filters=NOT_CHANNEL))
+        application.add_handler(CommandHandler("session", session_command, filters=NOT_CHANNEL))
+        application.add_handler(
+            MessageHandler(LOGIN_FLOW_FILTER, login_flow_message), group=1
+        )
 
-        # --- GMUTE watcher (default group 0 handles commands first,
-        # this watcher runs in group 1 afterwards for every message) ---
-        application.add_handler(MessageHandler(GMUTE_MSG_FILTER, gmute_watcher), group=1)
+        # ---- moderation ----
+        application.add_handler(CommandHandler("blacklist", blacklist_command, filters=NOT_CHANNEL))
+        application.add_handler(CommandHandler("unblacklist", unblacklist_command, filters=NOT_CHANNEL))
+        application.add_handler(CommandHandler("trust", trust_command, filters=NOT_CHANNEL))
+        application.add_handler(CommandHandler("untrust", untrust_command, filters=NOT_CHANNEL))
+        application.add_handler(CommandHandler("gmute", gmute_command, filters=NOT_CHANNEL))
+        application.add_handler(CommandHandler("ungmute", ungmute_command, filters=NOT_CHANNEL))
+        application.add_handler(CommandHandler("gmuteinfo", gmuteinfo_command, filters=NOT_CHANNEL))
+
+        # ---- info ----
+        application.add_handler(CommandHandler("security", security_command, filters=NOT_CHANNEL))
+        application.add_handler(CommandHandler("logs", logs_command, filters=NOT_CHANNEL))
+
+        # ---- gmute watcher (runs after commands) ----
+        application.add_handler(
+            MessageHandler(GMUTE_MSG_FILTER, gmute_watcher), group=1
+        )
 
         application.add_error_handler(error_handler)
 
-        logger.info("Telegram bot started — polling for updates…")
+        logger.info("PTB bot started — polling…")
         application.run_polling(
             drop_pending_updates=True,
             allowed_updates=Update.ALL_TYPES,
-            stop_signals=None,  # we are NOT in the main thread
+            stop_signals=None,
         )
     except InvalidToken:
-        logger.error(
-            "Invalid BOT_TOKEN — check the token from @BotFather in your .env file."
-        )
+        logger.error("Invalid BOT_TOKEN.")
     except TelegramError as exc:
         logger.error("Telegram API error: %s", exc, exc_info=True)
     except Exception as exc:  # noqa: BLE001
-        logger.error("Bot crashed unexpectedly: %s", exc, exc_info=True)
+        logger.error("Bot crashed: %s", exc, exc_info=True)
         raise
     finally:
-        # run_polling(close_loop=True) normally closes the loop itself.
-        # Only close here if an error happened before/while it started.
         if not loop.is_closed():
             loop.close()
 
 
 def start_bot_thread() -> threading.Thread:
-    """Start the bot's polling loop in a background daemon thread.
-
-    Exactly ONE thread is ever created, so there is always exactly
-    ONE polling instance running.
-    """
-    thread = threading.Thread(target=run_bot, name="pen-fight-bot", daemon=True)
-    thread.start()
-    return thread
+    t = threading.Thread(target=run_bot, name="pen-fight-bot", daemon=True)
+    t.start()
+    return t
