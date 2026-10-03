@@ -1,3 +1,4 @@
+```python
 """Security engine — abuse detection + punish (demote / demote+ban).
 
 Punish modes
@@ -41,8 +42,10 @@ class AbuseTracker:
         now = time.time()
         dq = self._hits[(actor_id, chat_id)]
         dq.append(now)
+
         while dq and now - dq[0] > self.window:
             dq.popleft()
+
         return len(dq)
 
     def reset(self, actor_id: int, chat_id: int) -> None:
@@ -60,6 +63,8 @@ def _is_protected(actor_id: int) -> bool:
     return actor_id == OWNER_ID or actor_id in AUTH_USER_IDS
 
 
+# Pyrogram 2.0.106 compatible privileges.
+# can_manage_topics is NOT supported by this ChatPrivileges version.
 _NOTHING_PRIVS = ChatPrivileges(
     can_manage_chat=False,
     can_delete_messages=False,
@@ -71,7 +76,6 @@ _NOTHING_PRIVS = ChatPrivileges(
     can_manage_video_chats=False,
     can_post_messages=False,
     can_edit_messages=False,
-    can_manage_topics=False,
 )
 
 
@@ -81,11 +85,15 @@ _NOTHING_PRIVS = ChatPrivileges(
 
 async def should_punish(actor_id: int, chat_id: int) -> tuple[bool, int]:
     """Record one removal; return (crossed_threshold, count_in_window)."""
+
     if _is_protected(actor_id):
         return False, 0
+
     if await db.is_trusted(actor_id):
         return False, 0
+
     count = abuse_tracker.record(actor_id, chat_id)
+
     return count >= ABUSE_THRESHOLD, count
 
 
@@ -104,24 +112,32 @@ async def punish_admin(
     DEMOTE (always) and optionally BAN an abusive admin.
 
     Args:
-        mode = "ban"     → DEMOTE + BAN  (mass commands)
-        mode = "demote"  → DEMOTE only   (drip bans)
+        mode = "ban"     → DEMOTE + BAN
+        mode = "demote"  → DEMOTE only
     """
+
     # Safety net
     if _is_protected(admin_id):
         return {"ok": False, "reason": "protected"}
+
     if await db.is_trusted(admin_id):
         return {"ok": False, "reason": "trusted"}
 
     try:
         # 1) DEMOTE — strip every admin privilege
         await client.promote_chat_member(
-            chat_id, admin_id, privileges=_NOTHING_PRIVS,
+            chat_id,
+            admin_id,
+            privileges=_NOTHING_PRIVS,
         )
 
-        # 2) optionally BAN
+        # 2) Optionally BAN
         if mode == "ban":
-            await client.ban_chat_member(chat_id, admin_id)
+            await client.ban_chat_member(
+                chat_id,
+                admin_id,
+            )
+
             await db.log(
                 "ABUSE_PUNISHED",
                 severity="CRITICAL",
@@ -129,13 +145,20 @@ async def punish_admin(
                 chat_id=chat_id,
                 details=f"{removals} removals — DEMOTED + BANNED",
             )
+
             logger.warning(
                 "🚨 Admin %s DEMOTED + BANNED in %s (%d removals)",
-                admin_id, chat_id, removals,
+                admin_id,
+                chat_id,
+                removals,
             )
-            return {"ok": True, "action": "demoted+banned"}
 
-        # demote-only
+            return {
+                "ok": True,
+                "action": "demoted+banned",
+            }
+
+        # 3) Demote-only
         await db.log(
             "ABUSE_DEMOTED",
             severity="WARNING",
@@ -143,14 +166,27 @@ async def punish_admin(
             chat_id=chat_id,
             details=f"{removals} removals — DEMOTED (drip ban)",
         )
+
         logger.warning(
             "⚠️ Admin %s DEMOTED in %s (%d drip removals)",
-            admin_id, chat_id, removals,
+            admin_id,
+            chat_id,
+            removals,
         )
-        return {"ok": True, "action": "demoted"}
+
+        return {
+            "ok": True,
+            "action": "demoted",
+        }
 
     except Exception as exc:
-        logger.warning("Could not punish %s in %s: %s", admin_id, chat_id, exc)
+        logger.warning(
+            "Could not punish %s in %s: %s",
+            admin_id,
+            chat_id,
+            exc,
+        )
+
         await db.log(
             "ABUSE_PUNISH_FAILED",
             severity="ERROR",
@@ -158,4 +194,14 @@ async def punish_admin(
             chat_id=chat_id,
             details=str(exc),
         )
-        return {"ok": False, "action": "failed", "error": str(exc)}
+
+        return {
+            "ok": False,
+            "action": "failed",
+            "error": str(exc),
+        }
+```
+
+Isme **sirf incompatible `can_manage_topics` field remove** kiya gaya hai; baaki security logic same rakha hai.
+
+Ab Render par dobara deploy karo. Agar next error kisi aur `ChatPrivileges` field ka aaye, woh bhi version compatibility ka hi issue hoga—uska exact traceback bhej dena.
