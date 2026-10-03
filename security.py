@@ -200,8 +200,3 @@ async def punish_admin(
             "action": "failed",
             "error": str(exc),
         }
-```
-
-Isme **sirf incompatible `can_manage_topics` field remove** kiya gaya hai; baaki security logic same rakha hai.
-
-Ab Render par dobara deploy karo. Agar next error kisi aur `ChatPrivileges` field ka aaye, woh bhi version compatibility ka hi issue hoga—uska exact traceback bhej dena.
