@@ -1,18 +1,18 @@
 """Pen Fight Bot — commands + security layer.
 
-Two clients live in this process:
-  1. THIS PTB bot   — commands, Mini App button, login flow UI, moderation.
-  2. Pyrogram userbot (userbot.py) — MTProto session used for admin-level
+Two clients run in this process:
+  1. THIS PTB bot     — commands, Mini App button, login flow UI, moderation.
+  2. Pyrogram userbot (userbot.py) — MTProto session for admin-level
      enforcement (demote/ban, VC kick). Runs in its own thread.
 
-Authorization
-  • AUTH_USER_IDS (env, comma-separated) — who may use security commands.
-  • OWNER_ID is ALWAYS authorized (auto-added to the set).
+Authorization (from config.py / .env)
+  • AUTH_USER_IDS — who may use security commands.
+  • OWNER_ID is auto-included in AUTH_USER_IDS by config.py.
   • /game is PUBLIC — anyone can play, no auth needed.
 
 Chat scope
   • PRIVATE chats + GROUPS (public + private) → handled.
-  • CHANNELS → completely ignored (no handler matches).
+  • CHANNELS → completely ignored.
 """
 
 import asyncio
@@ -21,11 +21,7 @@ import logging
 import os
 import threading
 
-from telegram import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Update,
-)
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatType
 from telegram.error import InvalidToken, TelegramError
 from telegram.ext import (
@@ -37,29 +33,27 @@ from telegram.ext import (
 )
 
 import config
-from config import BOT_TOKEN, OWNER_ID
+from config import (
+    API_HASH,
+    API_ID,
+    AUTH_USER_IDS,
+    BOT_TOKEN,
+    MINI_APP_URL,
+    OWNER_ID,
+)
 from database import db
 from userbot import call_userbot, userbot
 
 logger = logging.getLogger(__name__)
 
+
 # ---------------------------------------------------------------------------
 # Authorization
 # ---------------------------------------------------------------------------
-# Reuse the SAME env variable as before — no separate auth system.
-AUTH_USER_IDS: set[int] = {
-    int(uid.strip())
-    for uid in os.environ.get("AUTH_USER_IDS", "").split(",")
-    if uid.strip().isdigit()
-}
-
-# Owner is always authorized, no need to add their id to the env manually.
-if OWNER_ID:
-    AUTH_USER_IDS.add(OWNER_ID)
 
 if not AUTH_USER_IDS:
     logger.warning(
-        "No authorized users (AUTH_USER_IDS empty). Security commands disabled."
+        "No authorized users found. Security commands disabled for everyone."
     )
 
 
@@ -68,10 +62,8 @@ def is_authorized(user_id: int | None) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Mini App / texts / keyboards
+# Texts / keyboards
 # ---------------------------------------------------------------------------
-
-MINI_APP_URL = "https://t.me/Penfightgamebot/penfight"
 
 NO_ACCESS_TEXT = (
     "🚫 <b>Access Denied</b>\n\n"
@@ -89,6 +81,7 @@ GAME_TEXT = "🖊️ <b>PEN FIGHT</b>\n\nReady to play? Tap below to enter the g
 
 
 def _game_keyboard() -> InlineKeyboardMarkup:
+    # NOTE: URL button (not web_app=) — Telegram rejects web_app in groups.
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("🖊️ PLAY PEN FIGHT", url=MINI_APP_URL)]]
     )
@@ -100,6 +93,12 @@ def _game_keyboard() -> InlineKeyboardMarkup:
 
 NOT_CHANNEL = ~filters.ChatType.CHANNEL
 GROUPS_ONLY = filters.ChatType.GROUPS
+PRIVATE_TEXT_NOCMD = filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND
+
+
+def _is_dm(update: Update) -> bool:
+    chat = update.effective_chat
+    return chat is not None and chat.type == ChatType.PRIVATE
 
 
 # ---------------------------------------------------------------------------
@@ -128,7 +127,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
 
-    # Channel → ignore (should never happen, but be safe)
+    # Channel → silently ignore
     if chat_type == ChatType.CHANNEL:
         return
 
@@ -148,7 +147,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "/unblacklist — remove from blacklist\n"
         "/trust — exempt an admin from auto-punish\n"
         "/untrust — remove exemption\n"
-        "/gmute — globally mute · /ungmute · /gmuteinfo\n\n"
+        "/gmute · /ungmute · /gmuteinfo — global mute\n\n"
         "<b>Reports</b>\n"
         "/security — security dashboard\n"
         "/logs — recent security events\n\n"
@@ -167,13 +166,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 _LOGIN_STATES: dict[int, dict] = {}
 
 
-def _is_dm(update: Update) -> bool:
-    return (
-        update.effective_chat is not None
-        and update.effective_chat.type == ChatType.PRIVATE
-    )
-
-
 async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_user:
         return
@@ -183,7 +175,7 @@ async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not is_authorized(update.effective_user.id):
         await update.message.reply_text(NO_ACCESS_TEXT, parse_mode="HTML")
         return
-    if not config.API_ID or not config.API_HASH:
+    if not API_ID or not API_HASH:
         await update.message.reply_text(
             "⚙️ API_ID / API_HASH not set. Add them to .env first."
         )
@@ -244,7 +236,7 @@ async def session_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def login_flow_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle phone / OTP / 2FA-password while a user is in the login flow."""
+    """Handle phone / OTP / 2FA while the user is in the login flow."""
     if not update.message or not update.effective_user or not update.message.text:
         return
     user_id = update.effective_user.id
@@ -313,8 +305,10 @@ async def login_flow_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
             pass
         result = await call_userbot(
             userbot.login_complete(
-                state["phone"], state["phone_code_hash"],
-                state.get("code", ""), password=text,
+                state["phone"],
+                state["phone_code_hash"],
+                state.get("code", ""),
+                password=text,
             )
         )
         _LOGIN_STATES.pop(user_id, None)
@@ -327,7 +321,7 @@ async def login_flow_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 # ---------------------------------------------------------------------------
-# Moderation (auth + groups + reply-based)
+# Moderation helpers
 # ---------------------------------------------------------------------------
 
 def _target_from_reply(update: Update):
@@ -338,7 +332,7 @@ def _target_from_reply(update: Update):
 
 
 async def _deny_if_not_allowed(update: Update) -> bool:
-    """Return True if the caller is NOT allowed and we already replied."""
+    """Return True if the caller is NOT allowed (already replied)."""
     if not update.message or not update.effective_user:
         return True
     if not is_authorized(update.effective_user.id):
@@ -353,6 +347,10 @@ async def _deny_if_not_allowed(update: Update) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Moderation commands (auth + groups + reply-based)
+# ---------------------------------------------------------------------------
+
 async def blacklist_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await _deny_if_not_allowed(update):
         return
@@ -361,17 +359,17 @@ async def blacklist_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text("Reply to a user's message with /blacklist.")
         return
 
-    await db.add_blacklist(
-        user_id=target.id, added_by=update.effective_user.id,
-    )
+    await db.add_blacklist(user_id=target.id, added_by=update.effective_user.id)
     await db.log(
-        "BLACKLIST_ADD", severity="WARNING",
-        actor_id=update.effective_user.id, target_id=target.id,
+        "BLACKLIST_ADD",
+        severity="WARNING",
+        actor_id=update.effective_user.id,
+        target_id=target.id,
         chat_id=update.effective_chat.id,
     )
     await update.message.reply_text(
         f"🚫 {target.first_name} blacklisted.\n"
-        "They will be kicked from groups and voice chats automatically."
+        "They will be muted/kicked from voice chats automatically."
     )
 
 
@@ -385,8 +383,10 @@ async def unblacklist_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     await db.remove_blacklist(target.id)
     await db.log(
-        "BLACKLIST_REMOVE", actor_id=update.effective_user.id,
-        target_id=target.id, chat_id=update.effective_chat.id,
+        "BLACKLIST_REMOVE",
+        actor_id=update.effective_user.id,
+        target_id=target.id,
+        chat_id=update.effective_chat.id,
     )
     await update.message.reply_text(f"✅ {target.first_name} removed from blacklist.")
 
@@ -401,7 +401,9 @@ async def trust_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     await db.add_trusted(target.id, update.effective_user.id)
     await db.log(
-        "TRUST_ADD", actor_id=update.effective_user.id, target_id=target.id,
+        "TRUST_ADD",
+        actor_id=update.effective_user.id,
+        target_id=target.id,
         chat_id=update.effective_chat.id,
     )
     await update.message.reply_text(
@@ -419,14 +421,16 @@ async def untrust_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     await db.remove_trusted(target.id)
     await db.log(
-        "TRUST_REMOVE", actor_id=update.effective_user.id, target_id=target.id,
+        "TRUST_REMOVE",
+        actor_id=update.effective_user.id,
+        target_id=target.id,
         chat_id=update.effective_chat.id,
     )
     await update.message.reply_text(f"✅ {target.first_name} is no longer trusted.")
 
 
 # ---------------------------------------------------------------------------
-# GMUTE (existing behaviour — unified auth check)
+# GMUTE (existing behaviour — JSON storage kept as-is)
 # ---------------------------------------------------------------------------
 
 GMUTE_FILE = "gmute_users.json"
@@ -473,7 +477,9 @@ async def gmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     _global_muted.add(target.id)
     _save_gmuted()
-    await db.log("GMUTE_ADD", actor_id=update.effective_user.id, target_id=target.id)
+    await db.log(
+        "GMUTE_ADD", actor_id=update.effective_user.id, target_id=target.id
+    )
     await update.message.reply_text("🔇 User has been globally muted.")
 
 
@@ -490,7 +496,9 @@ async def ungmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     _global_muted.discard(target.id)
     _save_gmuted()
-    await db.log("GMUTE_REMOVE", actor_id=update.effective_user.id, target_id=target.id)
+    await db.log(
+        "GMUTE_REMOVE", actor_id=update.effective_user.id, target_id=target.id
+    )
     await update.message.reply_text("🔊 User has been globally unmuted.")
 
 
@@ -521,7 +529,7 @@ async def gmuteinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 # ---------------------------------------------------------------------------
-# GMUTE watcher
+# GMUTE watcher (group=1, runs after commands in group=0)
 # ---------------------------------------------------------------------------
 
 async def gmute_watcher(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -536,15 +544,14 @@ async def gmute_watcher(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     try:
         await message.delete()
     except TelegramError as exc:
-        logger.debug("GMUTE delete failed chat=%s msg=%s: %s",
-                     message.chat_id, message.message_id, exc)
+        logger.debug(
+            "GMUTE delete failed chat=%s msg=%s: %s",
+            message.chat_id, message.message_id, exc,
+        )
 
 
-GMUTE_MSG_FILTER = filters.ALL & ~filters.StatusUpdate.ALL & filters.ChatType.GROUPS
-
-# Login flow only picks up non-command DM text.
-LOGIN_FLOW_FILTER = (
-    filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND
+GMUTE_MSG_FILTER = (
+    filters.ALL & ~filters.StatusUpdate.ALL & filters.ChatType.GROUPS
 )
 
 
@@ -573,7 +580,9 @@ async def security_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         f"Monitored groups: {len(groups)}\n"
         f"Blacklisted users: {len(blacklist)}\n"
         f"Globally muted: {len(_global_muted)}\n\n"
-        f"Abuse window: {config.ABUSE_THRESHOLD} removals / {config.ABUSE_WINDOW_SECONDS}s",
+        f"Abuse rule: {config.ABUSE_THRESHOLD} removals / "
+        f"{config.ABUSE_WINDOW_SECONDS}s\n"
+        f"Authorized users: {len(AUTH_USER_IDS)}",
         parse_mode="HTML",
     )
 
@@ -596,7 +605,8 @@ async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         e = emoji.get(ev.get("severity", "INFO"), "ℹ️")
         lines.append(
             f"{e} <b>{ev['event_type']}</b>\n"
-            f"  actor: {ev.get('actor_id') or '—'} · target: {ev.get('target_id') or '—'}\n"
+            f"  actor: {ev.get('actor_id') or '—'} · "
+            f"target: {ev.get('target_id') or '—'}\n"
             f"  {ev.get('timestamp')}\n"
         )
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
@@ -616,6 +626,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 def run_bot() -> None:
     """Build PTB Application and start long polling (background thread)."""
+    # Python 3.12 / Render fix — create loop for THIS thread first
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
@@ -623,31 +634,59 @@ def run_bot() -> None:
         application = Application.builder().token(BOT_TOKEN).build()
 
         # ---- public ----
-        application.add_handler(CommandHandler("game", game_command, filters=NOT_CHANNEL))
-        application.add_handler(CommandHandler("start", start_command, filters=NOT_CHANNEL))
-
-        # ---- login (DM only, enforced inside handler too) ----
-        application.add_handler(CommandHandler("login", login_command, filters=NOT_CHANNEL))
-        application.add_handler(CommandHandler("logout", logout_command, filters=NOT_CHANNEL))
-        application.add_handler(CommandHandler("session", session_command, filters=NOT_CHANNEL))
         application.add_handler(
-            MessageHandler(LOGIN_FLOW_FILTER, login_flow_message), group=1
+            CommandHandler("game", game_command, filters=NOT_CHANNEL)
+        )
+        application.add_handler(
+            CommandHandler("start", start_command, filters=NOT_CHANNEL)
+        )
+
+        # ---- login (DM only, enforced inside handlers too) ----
+        application.add_handler(
+            CommandHandler("login", login_command, filters=NOT_CHANNEL)
+        )
+        application.add_handler(
+            CommandHandler("logout", logout_command, filters=NOT_CHANNEL)
+        )
+        application.add_handler(
+            CommandHandler("session", session_command, filters=NOT_CHANNEL)
         )
 
         # ---- moderation ----
-        application.add_handler(CommandHandler("blacklist", blacklist_command, filters=NOT_CHANNEL))
-        application.add_handler(CommandHandler("unblacklist", unblacklist_command, filters=NOT_CHANNEL))
-        application.add_handler(CommandHandler("trust", trust_command, filters=NOT_CHANNEL))
-        application.add_handler(CommandHandler("untrust", untrust_command, filters=NOT_CHANNEL))
-        application.add_handler(CommandHandler("gmute", gmute_command, filters=NOT_CHANNEL))
-        application.add_handler(CommandHandler("ungmute", ungmute_command, filters=NOT_CHANNEL))
-        application.add_handler(CommandHandler("gmuteinfo", gmuteinfo_command, filters=NOT_CHANNEL))
+        application.add_handler(
+            CommandHandler("blacklist", blacklist_command, filters=NOT_CHANNEL)
+        )
+        application.add_handler(
+            CommandHandler("unblacklist", unblacklist_command, filters=NOT_CHANNEL)
+        )
+        application.add_handler(
+            CommandHandler("trust", trust_command, filters=NOT_CHANNEL)
+        )
+        application.add_handler(
+            CommandHandler("untrust", untrust_command, filters=NOT_CHANNEL)
+        )
+        application.add_handler(
+            CommandHandler("gmute", gmute_command, filters=NOT_CHANNEL)
+        )
+        application.add_handler(
+            CommandHandler("ungmute", ungmute_command, filters=NOT_CHANNEL)
+        )
+        application.add_handler(
+            CommandHandler("gmuteinfo", gmuteinfo_command, filters=NOT_CHANNEL)
+        )
 
         # ---- info ----
-        application.add_handler(CommandHandler("security", security_command, filters=NOT_CHANNEL))
-        application.add_handler(CommandHandler("logs", logs_command, filters=NOT_CHANNEL))
+        application.add_handler(
+            CommandHandler("security", security_command, filters=NOT_CHANNEL)
+        )
+        application.add_handler(
+            CommandHandler("logs", logs_command, filters=NOT_CHANNEL)
+        )
 
-        # ---- gmute watcher (runs after commands) ----
+        # ---- group 1: login flow (DM text) + gmute watcher (groups) ----
+        application.add_handler(
+            MessageHandler(PRIVATE_TEXT_NOCMD, login_flow_message), group=1
+        )
         application.add_handler(
             MessageHandler(GMUTE_MSG_FILTER, gmute_watcher), group=1
         )
@@ -658,8 +697,9 @@ def run_bot() -> None:
         application.run_polling(
             drop_pending_updates=True,
             allowed_updates=Update.ALL_TYPES,
-            stop_signals=None,
+            stop_signals=None,        # we are NOT in the main thread
         )
+
     except InvalidToken:
         logger.error("Invalid BOT_TOKEN.")
     except TelegramError as exc:
