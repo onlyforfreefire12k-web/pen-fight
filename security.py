@@ -1,14 +1,13 @@
-```python
 """Security engine — abuse detection + punish (demote / demote+ban).
 
 Punish modes
-  • "ban"    → DEMOTE + BAN  (for /banall, /kickall commands — destructive)
-  • "demote" → DEMOTE only   (for drip bans — one-by-one, less harmful)
+  • "ban"    → DEMOTE + BAN
+  • "demote" → DEMOTE only
 
 Never punished
   • OWNER_ID
   • Anyone in AUTH_USER_IDS
-  • Anyone in `trusted_admins` (added via /trust)
+  • Anyone in trusted_admins (added via /trust)
 """
 
 import logging
@@ -28,10 +27,6 @@ from database import db
 
 logger = logging.getLogger(__name__)
 
-
-# ---------------------------------------------------------------------------
-# Sliding window
-# ---------------------------------------------------------------------------
 
 class AbuseTracker:
     def __init__(self, window: int = ABUSE_WINDOW_SECONDS):
@@ -55,16 +50,10 @@ class AbuseTracker:
 abuse_tracker = AbuseTracker()
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 def _is_protected(actor_id: int) -> bool:
     return actor_id == OWNER_ID or actor_id in AUTH_USER_IDS
 
 
-# Pyrogram 2.0.106 compatible privileges.
-# can_manage_topics is NOT supported by this ChatPrivileges version.
 _NOTHING_PRIVS = ChatPrivileges(
     can_manage_chat=False,
     can_delete_messages=False,
@@ -79,11 +68,10 @@ _NOTHING_PRIVS = ChatPrivileges(
 )
 
 
-# ---------------------------------------------------------------------------
-# Decision
-# ---------------------------------------------------------------------------
-
-async def should_punish(actor_id: int, chat_id: int) -> tuple[bool, int]:
+async def should_punish(
+    actor_id: int,
+    chat_id: int,
+) -> tuple[bool, int]:
     """Record one removal; return (crossed_threshold, count_in_window)."""
 
     if _is_protected(actor_id):
@@ -97,10 +85,6 @@ async def should_punish(actor_id: int, chat_id: int) -> tuple[bool, int]:
     return count >= ABUSE_THRESHOLD, count
 
 
-# ---------------------------------------------------------------------------
-# Punish
-# ---------------------------------------------------------------------------
-
 async def punish_admin(
     client: Client,
     chat_id: int,
@@ -109,29 +93,31 @@ async def punish_admin(
     mode: str = "ban",
 ) -> dict:
     """
-    DEMOTE (always) and optionally BAN an abusive admin.
+    DEMOTE always and optionally BAN an abusive admin.
 
-    Args:
-        mode = "ban"     → DEMOTE + BAN
-        mode = "demote"  → DEMOTE only
+    mode = "ban"    → DEMOTE + BAN
+    mode = "demote" → DEMOTE only
     """
 
-    # Safety net
     if _is_protected(admin_id):
-        return {"ok": False, "reason": "protected"}
+        return {
+            "ok": False,
+            "reason": "protected",
+        }
 
     if await db.is_trusted(admin_id):
-        return {"ok": False, "reason": "trusted"}
+        return {
+            "ok": False,
+            "reason": "trusted",
+        }
 
     try:
-        # 1) DEMOTE — strip every admin privilege
         await client.promote_chat_member(
             chat_id,
             admin_id,
             privileges=_NOTHING_PRIVS,
         )
 
-        # 2) Optionally BAN
         if mode == "ban":
             await client.ban_chat_member(
                 chat_id,
@@ -147,7 +133,7 @@ async def punish_admin(
             )
 
             logger.warning(
-                "🚨 Admin %s DEMOTED + BANNED in %s (%d removals)",
+                "Admin %s DEMOTED + BANNED in %s (%d removals)",
                 admin_id,
                 chat_id,
                 removals,
@@ -158,7 +144,6 @@ async def punish_admin(
                 "action": "demoted+banned",
             }
 
-        # 3) Demote-only
         await db.log(
             "ABUSE_DEMOTED",
             severity="WARNING",
@@ -168,7 +153,7 @@ async def punish_admin(
         )
 
         logger.warning(
-            "⚠️ Admin %s DEMOTED in %s (%d drip removals)",
+            "Admin %s DEMOTED in %s (%d drip removals)",
             admin_id,
             chat_id,
             removals,
