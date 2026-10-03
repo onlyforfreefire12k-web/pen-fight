@@ -73,17 +73,17 @@ NO_ACCESS_TEXT = (
 
 WELCOME_TEXT = (
     "🎮 <b>Welcome to Pen Fight!</b> 🖊️\n\n"
-    "Play the classic childhood Pen Fight game in 3D.\n\n"
+    "Play the new INv Fight game in 3D.\n\n"
     "Use /game to start playing."
 )
 
-GAME_TEXT = "🖊️ <b>PEN FIGHT</b>\n\nReady to play? Tap below to enter the game."
+GAME_TEXT = "🖊️ <b>INV FIGHT</b>\n\nReady to play? Tap below to enter the game."
 
 
 def _game_keyboard() -> InlineKeyboardMarkup:
     # NOTE: URL button (not web_app=) — Telegram rejects web_app in groups.
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("🖊️ PLAY PEN FIGHT", url=MINI_APP_URL)]]
+        [[InlineKeyboardButton("INV FIGHT FIGHT", url=MINI_APP_URL)]]
     )
 
 
