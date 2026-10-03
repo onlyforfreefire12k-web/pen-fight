@@ -1,18 +1,13 @@
-"""Security engine — abuse detection + punish (demote + ban).
+"""Security engine — abuse detection + punish (demote / demote+ban).
 
-How abuse detection works
-  1. Every time a user is banned/kicked in a supergroup where the userbot
-     is admin, Pyrogram sends `raw.types.UpdateChannelParticipant` with
-     `actor_id` = the admin who did it.
-  2. `abuse_tracker.record(actor_id, chat_id)` keeps a sliding window of
-      removal timestamps per (actor, chat).
-  3. If the count crosses `ABUSE_THRESHOLD` within `ABUSE_WINDOW_SECONDS`,
-     `punish_admin()` DEMOTES then BANS the actor.
+Punish modes
+  • "ban"    → DEMOTE + BAN  (for /banall, /kickall commands — destructive)
+  • "demote" → DEMOTE only   (for drip bans — one-by-one, less harmful)
 
-Never auto-punished
+Never punished
   • OWNER_ID
-  • Anyone in AUTH_USER_IDS (bot's authorized users)
-  • Anyone in the `trusted_admins` table (added via /trust)
+  • Anyone in AUTH_USER_IDS
+  • Anyone in `trusted_admins` (added via /trust)
 """
 
 import logging
@@ -34,18 +29,15 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Sliding-window abuse tracker
+# Sliding window
 # ---------------------------------------------------------------------------
 
 class AbuseTracker:
-    """Per (actor_id, chat_id) sliding window of removal timestamps."""
-
     def __init__(self, window: int = ABUSE_WINDOW_SECONDS):
         self.window = window
         self._hits: dict[tuple[int, int], deque[float]] = defaultdict(deque)
 
     def record(self, actor_id: int, chat_id: int) -> int:
-        """Record one removal and return the count within the window."""
         now = time.time()
         dq = self._hits[(actor_id, chat_id)]
         dq.append(now)
@@ -65,96 +57,99 @@ abuse_tracker = AbuseTracker()
 # ---------------------------------------------------------------------------
 
 def _is_protected(actor_id: int) -> bool:
-    """Never auto-punish the owner or any authorized user."""
     return actor_id == OWNER_ID or actor_id in AUTH_USER_IDS
 
 
-def _chat_id_from_raw(raw_channel_id: int) -> int:
-    """RAW Pyrogram channel_id  →  PTB-style supergroup chat_id  (-100…)."""
-    return int(f"-100{raw_channel_id}")
+_NOTHING_PRIVS = ChatPrivileges(
+    can_manage_chat=False,
+    can_delete_messages=False,
+    can_restrict_members=False,
+    can_promote_members=False,
+    can_change_info=False,
+    can_invite_users=False,
+    can_pin_messages=False,
+    can_manage_video_chats=False,
+    can_post_messages=False,
+    can_edit_messages=False,
+    can_manage_topics=False,
+)
 
 
 # ---------------------------------------------------------------------------
-# Decision + punish
+# Decision
 # ---------------------------------------------------------------------------
 
 async def should_punish(actor_id: int, chat_id: int) -> tuple[bool, int]:
-    """
-    Record one removal and decide if the actor crossed the threshold.
-
-    Returns:
-        (crossed_threshold: bool, count_in_window: int)
-
-    Protected actors (owner / auth users / trusted) are NOT recorded —
-    returns (False, 0).
-    """
+    """Record one removal; return (crossed_threshold, count_in_window)."""
     if _is_protected(actor_id):
         return False, 0
     if await db.is_trusted(actor_id):
         return False, 0
-
     count = abuse_tracker.record(actor_id, chat_id)
     return count >= ABUSE_THRESHOLD, count
 
 
+# ---------------------------------------------------------------------------
+# Punish
+# ---------------------------------------------------------------------------
+
 async def punish_admin(
-    client: Client, chat_id: int, admin_id: int, removals: int
+    client: Client,
+    chat_id: int,
+    admin_id: int,
+    removals: int,
+    mode: str = "ban",
 ) -> dict:
     """
-    DEMOTE then BAN an abusive admin (defence in depth).
+    DEMOTE (always) and optionally BAN an abusive admin.
 
-    Returns:
-        {'ok': True,  'action': 'demoted+banned'}
-        {'ok': False, 'reason': 'protected'|'trusted'}         — skipped
-        {'ok': False, 'action': 'failed', 'error': '...'}      — Telegram refused
+    Args:
+        mode = "ban"     → DEMOTE + BAN  (mass commands)
+        mode = "demote"  → DEMOTE only   (drip bans)
     """
-    # Safety net — never punish protected actors even if called directly.
+    # Safety net
     if _is_protected(admin_id):
         return {"ok": False, "reason": "protected"}
     if await db.is_trusted(admin_id):
         return {"ok": False, "reason": "trusted"}
 
     try:
-        # 1) DEMOTE — strip every admin privilege (back to plain member)
+        # 1) DEMOTE — strip every admin privilege
         await client.promote_chat_member(
-            chat_id,
-            admin_id,
-            privileges=ChatPrivileges(
-                can_manage_chat=False,
-                can_delete_messages=False,
-                can_restrict_members=False,
-                can_promote_members=False,
-                can_change_info=False,
-                can_invite_users=False,
-                can_pin_messages=False,
-                can_manage_video_chats=False,
-                can_post_messages=False,
-                can_edit_messages=False,
-                can_manage_topics=False,
-            ),
+            chat_id, admin_id, privileges=_NOTHING_PRIVS,
         )
 
-        # 2) BAN — permanent
-        await client.ban_chat_member(chat_id, admin_id)
+        # 2) optionally BAN
+        if mode == "ban":
+            await client.ban_chat_member(chat_id, admin_id)
+            await db.log(
+                "ABUSE_PUNISHED",
+                severity="CRITICAL",
+                actor_id=admin_id,
+                chat_id=chat_id,
+                details=f"{removals} removals — DEMOTED + BANNED",
+            )
+            logger.warning(
+                "🚨 Admin %s DEMOTED + BANNED in %s (%d removals)",
+                admin_id, chat_id, removals,
+            )
+            return {"ok": True, "action": "demoted+banned"}
 
+        # demote-only
         await db.log(
-            "ABUSE_PUNISHED",
-            severity="CRITICAL",
+            "ABUSE_DEMOTED",
+            severity="WARNING",
             actor_id=admin_id,
             chat_id=chat_id,
-            details=(
-                f"{removals} removals in {ABUSE_WINDOW_SECONDS}s "
-                f"— demoted + banned"
-            ),
+            details=f"{removals} removals — DEMOTED (drip ban)",
         )
         logger.warning(
-            "🚨 Abusive admin %s punished in %s (%d removals)",
+            "⚠️ Admin %s DEMOTED in %s (%d drip removals)",
             admin_id, chat_id, removals,
         )
-        return {"ok": True, "action": "demoted+banned"}
+        return {"ok": True, "action": "demoted"}
 
     except Exception as exc:
-        # Usually: target is the creator, or outranks the userbot.
         logger.warning("Could not punish %s in %s: %s", admin_id, chat_id, exc)
         await db.log(
             "ABUSE_PUNISH_FAILED",
