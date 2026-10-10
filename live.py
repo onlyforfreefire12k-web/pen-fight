@@ -1,8 +1,7 @@
 """Entry point — run everything with: python live.py
 
-1. Starts the userbot (Pyrogram MTProto) in a background thread.
-2. Starts the PTB bot in a second background thread.
-3. Starts Flask in the main thread (keeps Render alive).
+1. Starts the PTB bot in a background thread (/start + /game only).
+2. Starts Flask in the main thread (keeps Render alive).
 """
 
 import logging
@@ -11,7 +10,6 @@ from flask import Flask, Response
 
 from bot import start_bot_thread
 from config import PORT
-from userbot import start_userbot_thread
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,15 +31,11 @@ def health() -> Response:
 
 
 def main() -> None:
-    # 1) Userbot thread (Pyrogram, MTProto)
-    ub_thread = start_userbot_thread()
-    logger.info("Userbot thread: %s", ub_thread.name)
-
-    # 2) PTB bot thread
+    # 1) PTB bot thread (/start + /game)
     bot_thread = start_bot_thread()
     logger.info("Bot thread: %s", bot_thread.name)
 
-    # 3) Flask main thread
+    # 2) Flask main thread
     try:
         logger.info("Flask health server on 0.0.0.0:%s", PORT)
         app.run(host="0.0.0.0", port=PORT)
