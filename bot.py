@@ -43,7 +43,7 @@ GAME_TEXT = "🖊️ <b>Pen FIGHT</b>\n\nReady to play? Tap below to enter the g
 def _game_keyboard() -> InlineKeyboardMarkup:
     # NOTE: URL button (not web_app=) — Telegram rejects web_app in groups.
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("INV FIGHT FIGHT", url=MINI_APP_URL)]]
+        [[InlineKeyboardButton("PEN ARENA", url=MINI_APP_URL)]]
     )
 
 
