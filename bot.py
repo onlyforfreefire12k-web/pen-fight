@@ -33,11 +33,11 @@ logger = logging.getLogger(__name__)
 
 WELCOME_TEXT = (
     "🎮 <b>Welcome to Pen Fight!</b> 🖊️\n\n"
-    "Play the new INv Fight game in 3D.\n\n"
+    "Play the new Pen Fight game in 3D.\n\n"
     "Use /game to start playing."
 )
 
-GAME_TEXT = "🖊️ <b>INV FIGHT</b>\n\nReady to play? Tap below to enter the game."
+GAME_TEXT = "🖊️ <b>Pen FIGHT</b>\n\nReady to play? Tap below to enter the game."
 
 
 def _game_keyboard() -> InlineKeyboardMarkup:
