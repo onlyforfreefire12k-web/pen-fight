@@ -15,10 +15,16 @@ GAME_URL = os.getenv("GAME_URL")
 PORT = int(os.getenv("PORT", "8000"))
 
 # ---------------------------------------------------------------------------
-# Mini App button — URL that the /game button opens
+# Game buttons — URLs that the /game buttons open
 # ---------------------------------------------------------------------------
+# Pen Fight (main game)
 MINI_APP_URL = os.getenv(
     "MINI_APP_URL", "https://t.me/Penfightgamebot/penfight"
+)
+
+# Draw & Drop (second game)
+DRAW_DROP_URL = os.getenv(
+    "DRAW_DROP_URL", "https://t.me/Penfightgamebot/drawanddrop"  # ← apna link yaha daalo
 )
 
 # ---------------------------------------------------------------------------
@@ -38,4 +44,10 @@ if not MINI_APP_URL.startswith("https://t.me/"):
     raise RuntimeError(
         "[config] MINI_APP_URL must look like "
         "https://t.me/<bot_username>/<short_name>"
+    )
+
+if not DRAW_DROP_URL.startswith("https://"):
+    raise RuntimeError(
+        "[config] DRAW_DROP_URL must be a valid https URL "
+        "(t.me mini app link or website link)"
     )
