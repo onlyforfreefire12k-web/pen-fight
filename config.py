@@ -19,12 +19,17 @@ PORT = int(os.getenv("PORT", "8000"))
 # ---------------------------------------------------------------------------
 # Pen Fight (main game)
 MINI_APP_URL = os.getenv(
-    "MINI_APP_URL", "https://t.me/Penfightgamebot/penfight"
+    "MINI_APP_URL", "https://t.me/Penfightgamebot/Penfight"
 )
 
 # Draw & Drop (second game)
 DRAW_DROP_URL = os.getenv(
-    "DRAW_DROP_URL", "https://t.me/Penfightgamebot/drawanddrop"  # ← apna link yaha daalo
+    "DRAW_DROP_URL", "https://t.me/Penfightgamebot/drawanddrop"
+)
+
+# Snake & Ladders (third game)
+SNAKE_LADDERS_URL = os.getenv(
+    "SNAKE_LADDERS_URL", "https://t.me/Penfightgamebot/snakeandladders"
 )
 
 # ---------------------------------------------------------------------------
@@ -49,5 +54,11 @@ if not MINI_APP_URL.startswith("https://t.me/"):
 if not DRAW_DROP_URL.startswith("https://"):
     raise RuntimeError(
         "[config] DRAW_DROP_URL must be a valid https URL "
+        "(t.me mini app link or website link)"
+    )
+
+if not SNAKE_LADDERS_URL.startswith("https://"):
+    raise RuntimeError(
+        "[config] SNAKE_LADDERS_URL must be a valid https URL "
         "(t.me mini app link or website link)"
     )
