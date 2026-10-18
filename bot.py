@@ -2,7 +2,7 @@
 
 Single PTB bot client in this thread:
   • /start and /game — PUBLIC, anyone can play, no auth needed.
-  • /game shows 2 buttons: PEN ARENA + DRAW & DROP.
+  • /game shows 3 buttons: PEN ARENA + DRAW & DROP + SNAKE & LADDERS.
 
 Chat scope
   • PRIVATE chats + GROUPS (public + private) → handled.
@@ -23,7 +23,7 @@ from telegram.ext import (
     filters,
 )
 
-from config import BOT_TOKEN, DRAW_DROP_URL, MINI_APP_URL
+from config import BOT_TOKEN, DRAW_DROP_URL, MINI_APP_URL, SNAKE_LADDERS_URL
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +50,7 @@ def _game_keyboard() -> InlineKeyboardMarkup:
         [
             [InlineKeyboardButton("PEN ARENA", url=MINI_APP_URL)],
             [InlineKeyboardButton("DRAW & DROP", url=DRAW_DROP_URL)],
+            [InlineKeyboardButton("SNAKE & LADDERS", url=SNAKE_LADDERS_URL)],
         ]
     )
 
