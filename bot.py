@@ -49,7 +49,7 @@ def _game_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("PEN ARENA", url=MINI_APP_URL)],
-            [InlineKeyboardButton("DRAW & DROP", url=DRAW_DROP_URL)],
+            [InlineKeyboardButton("MINI & LUDO", url=DRAW_DROP_URL)],
             [InlineKeyboardButton("SNAKE & LADDERS", url=SNAKE_LADDERS_URL)],
         ]
     )
