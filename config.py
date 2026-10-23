@@ -15,6 +15,22 @@ GAME_URL = os.getenv("GAME_URL")
 PORT = int(os.getenv("PORT", "8000"))
 
 # ---------------------------------------------------------------------------
+# Authorization (for /gmute · /gunmute)
+# ---------------------------------------------------------------------------
+# OWNER_ID       → main owner (auto-included in AUTH_USER_IDS)
+# AUTH_USER_IDS  → comma-separated numeric ids allowed to use /gmute
+# ---------------------------------------------------------------------------
+OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)
+
+AUTH_USER_IDS: set[int] = {
+    int(x.strip())
+    for x in os.getenv("AUTH_USER_IDS", "").split(",")
+    if x.strip().isdigit()
+}
+if OWNER_ID:
+    AUTH_USER_IDS.add(OWNER_ID)
+
+# ---------------------------------------------------------------------------
 # Game buttons — URLs that the /game buttons open
 # ---------------------------------------------------------------------------
 # Pen Fight (main game)
