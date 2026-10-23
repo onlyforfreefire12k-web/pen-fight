@@ -1,8 +1,9 @@
-"""Pen Fight Bot — /game only.
+"""Pen Fight Bot — /game + gmute.
 
 Single PTB bot client in this thread:
   • /start and /game — PUBLIC, anyone can play, no auth needed.
   • /game shows 3 buttons: PEN ARENA + DRAW & DROP + SNAKE & LADDERS.
+  • /gmute, /gunmute (alias /ungmute) — AUTH USERS only, reply-based.
 
 Chat scope
   • PRIVATE chats + GROUPS (public + private) → handled.
@@ -10,7 +11,9 @@ Chat scope
 """
 
 import asyncio
+import json
 import logging
+import os
 import threading
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -20,17 +23,43 @@ from telegram.ext import (
     Application,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
     filters,
 )
 
-from config import BOT_TOKEN, DRAW_DROP_URL, MINI_APP_URL, SNAKE_LADDERS_URL
+from config import (
+    AUTH_USER_IDS,
+    BOT_TOKEN,
+    DRAW_DROP_URL,
+    MINI_APP_URL,
+)
 
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Authorization
+# ---------------------------------------------------------------------------
+
+if not AUTH_USER_IDS:
+    logger.warning(
+        "No authorized users found. /gmute commands disabled for everyone."
+    )
+
+
+def is_authorized(user_id: int | None) -> bool:
+    return user_id is not None and user_id in AUTH_USER_IDS
+
+
+# ---------------------------------------------------------------------------
 # Texts / keyboards
 # ---------------------------------------------------------------------------
+
+NO_ACCESS_TEXT = (
+    "🚫 <b>Access Denied</b>\n\n"
+    "You don't have permission to use this command.\n"
+    "Contact the owner if you think this is a mistake."
+)
 
 WELCOME_TEXT = (
     "🎮 <b>Welcome to Pen Fight!</b> 🖊️\n\n"
@@ -49,7 +78,7 @@ def _game_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("PEN ARENA", url=MINI_APP_URL)],
-            [InlineKeyboardButton("MINI & LUDO", url=DRAW_DROP_URL)],
+            [InlineKeyboardButton("DRAW & DROP", url=DRAW_DROP_URL)],
             [InlineKeyboardButton("SNAKE & LADDERS", url=SNAKE_LADDERS_URL)],
         ]
     )
@@ -89,6 +118,129 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 # ---------------------------------------------------------------------------
+# Moderation helpers
+# ---------------------------------------------------------------------------
+
+def _target_from_reply(update: Update):
+    msg = update.message
+    if not msg or not msg.reply_to_message:
+        return None
+    return msg.reply_to_message.from_user
+
+
+async def _deny_if_not_allowed(update: Update) -> bool:
+    """Return True if the caller is NOT allowed (already replied)."""
+    if not update.message or not update.effective_user:
+        return True
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text(NO_ACCESS_TEXT, parse_mode="HTML")
+        return True
+    chat = update.effective_chat
+    if chat is None or chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await update.message.reply_text(
+            "⚠️ This command only works in groups. Reply to a user's message."
+        )
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# GMUTE — auth-only, JSON storage
+# ---------------------------------------------------------------------------
+
+GMUTE_FILE = "gmute_users.json"
+_global_muted: set[int] = set()
+
+
+def _load_gmuted() -> set[int]:
+    try:
+        if os.path.exists(GMUTE_FILE):
+            with open(GMUTE_FILE, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, list):
+                return {int(u) for u in data}
+    except (OSError, ValueError) as exc:
+        logger.error("Could not load %s: %s", GMUTE_FILE, exc)
+    return set()
+
+
+def _save_gmuted() -> None:
+    try:
+        with open(GMUTE_FILE, "w", encoding="utf-8") as fh:
+            json.dump(sorted(_global_muted), fh)
+    except OSError as exc:
+        logger.error("Could not save %s: %s", GMUTE_FILE, exc)
+
+
+_global_muted = _load_gmuted()
+logger.info("GMUTE: loaded %d globally muted user(s).", len(_global_muted))
+
+
+async def gmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Auth-only. Reply to a user's message in a group."""
+    if await _deny_if_not_allowed(update):
+        return
+    target = _target_from_reply(update)
+    if not target:
+        await update.message.reply_text("Reply with /gmute to mute globally.")
+        return
+    if target.id == context.bot.id:
+        await update.message.reply_text("I can't globally mute myself.")
+        return
+    if target.id in _global_muted:
+        await update.message.reply_text("That user is already globally muted.")
+        return
+
+    _global_muted.add(target.id)
+    _save_gmuted()
+    await update.message.reply_text("🔇 User has been globally muted.")
+
+
+async def gunmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Auth-only. Serves both /gunmute and /ungmute."""
+    if await _deny_if_not_allowed(update):
+        return
+    target = _target_from_reply(update)
+    if not target:
+        await update.message.reply_text("Reply with /gunmute to unmute.")
+        return
+    if target.id not in _global_muted:
+        await update.message.reply_text("That user is not globally muted.")
+        return
+
+    _global_muted.discard(target.id)
+    _save_gmuted()
+    await update.message.reply_text("🔊 User has been globally unmuted.")
+
+
+# ---------------------------------------------------------------------------
+# GMUTE watcher (group=1, runs after commands in group=0)
+# ---------------------------------------------------------------------------
+
+async def gmute_watcher(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+    user = message.from_user
+    if user is None or user.is_bot:
+        return
+    if user.id not in _global_muted:
+        return
+    try:
+        await message.delete()
+    except TelegramError as exc:
+        logger.debug(
+            "GMUTE delete failed chat=%s msg=%s: %s",
+            message.chat_id, message.message_id, exc,
+        )
+
+
+GMUTE_MSG_FILTER = (
+    filters.ALL & ~filters.StatusUpdate.ALL & filters.ChatType.GROUPS
+)
+
+
+# ---------------------------------------------------------------------------
 # Error handler
 # ---------------------------------------------------------------------------
 
@@ -115,6 +267,22 @@ def run_bot() -> None:
         )
         application.add_handler(
             CommandHandler("start", start_command, filters=NOT_CHANNEL)
+        )
+
+        # ---- gmute (auth enforced inside handlers) ----
+        application.add_handler(
+            CommandHandler("gmute", gmute_command, filters=NOT_CHANNEL)
+        )
+        application.add_handler(
+            CommandHandler("ungmute", gunmute_command, filters=NOT_CHANNEL)
+        )
+        application.add_handler(
+            CommandHandler("gunmute", gunmute_command, filters=NOT_CHANNEL)
+        )
+
+        # ---- group 1: gmute watcher ----
+        application.add_handler(
+            MessageHandler(GMUTE_MSG_FILTER, gmute_watcher), group=1
         )
 
         application.add_error_handler(error_handler)
