@@ -32,6 +32,7 @@ from config import (
     BOT_TOKEN,
     DRAW_DROP_URL,
     MINI_APP_URL,
+    SNAKE_LADDERS_URL,
 )
 
 logger = logging.getLogger(__name__)
