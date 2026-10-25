@@ -78,7 +78,7 @@ def _game_keyboard() -> InlineKeyboardMarkup:
     # NOTE: URL buttons (not web_app=) — Telegram rejects web_app in groups.
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("3D FAIR", url=MINI_APP_URL)],
+            [InlineKeyboardButton("BADMINTON", url=MINI_APP_URL)],
             [InlineKeyboardButton("MINI LUDO", url=DRAW_DROP_URL)],
             [InlineKeyboardButton("SNAKE & LADDERS", url=SNAKE_LADDERS_URL)],
         ]
